@@ -181,6 +181,7 @@ try:
         .select(
             F.col("id").alias("record_id"),
             "section_id",
+            "provider_id",
             "org_id",
             F.col("is_deleted").alias("record_is_deleted"),
         )
@@ -200,6 +201,7 @@ try:
         read_rds_table(ATTRIBUTE_TABLE, "attribute_ctx")
         .select(
             F.col("id").alias("attribute_id"),
+            F.col("name").alias("attribute_name"),
             "section_id",
             "org_id",
         )
@@ -250,9 +252,8 @@ records_df = (
         "org_id",
         "section_id",
         "section_name",
-        "provider_id"
+        "provider_id",
     )
-    .persist(StorageLevel.MEMORY_AND_DISK)
 )
 
 values_with_context_df = (
@@ -268,14 +269,49 @@ values_with_context_df = (
         "attribute_id",
         "value",
     )
+)
+
+records_df = (
+    records_df
+    .repartition("org_id", "section_id")
     .persist(StorageLevel.MEMORY_AND_DISK)
 )
 
-records_df = records_df.repartition(F.col("org_id"), F.col("section_id")).persist(StorageLevel.MEMORY_AND_DISK)
-values_with_context_df = values_with_context_df.repartition(F.col("org_id"), F.col("section_id")).persist(StorageLevel.MEMORY_AND_DISK)
+values_with_context_df = (
+    values_with_context_df
+    .repartition("org_id", "section_id")
+    .persist(StorageLevel.MEMORY_AND_DISK)
+)
+
+attribute_df = attribute_df.persist(StorageLevel.MEMORY_AND_DISK)
 
 records_df.count()
 values_with_context_df.count()
+attribute_df.count()
+
+
+# ----------------------------------------------------------
+# Build attribute_section lookup table
+# ----------------------------------------------------------
+attribute_section_df = (
+    attribute_df.join(section_df, on="section_id", how="inner")
+    .select(
+        "attribute_id",
+        "section_id",
+        "attribute_name",
+        "section_name",
+        "org_id",
+    )
+    .persist(StorageLevel.MEMORY_AND_DISK)
+)
+
+try:
+    write_df_to_redshift(attribute_section_df, "public.attribute_section")
+except Exception as e:
+    log("Failed writing table public.attribute_section")
+    print(str(e))
+    print(traceback.format_exc())
+    raise
 
 
 # ----------------------------------------------------------
@@ -296,7 +332,7 @@ log(f"Found {len(org_section_rows)} org + section combinations")
 # Table name format:
 #   public.org_<org_id>_section_<section_id>
 # Columns:
-#   record_id, attr_<attribute_id>, attr_<attribute_id>, ...
+#   record_id, provider_id, attr_<attribute_id>, attr_<attribute_id>, ...
 # ----------------------------------------------------------
 for row in org_section_rows:
     org_id = row["org_id"]
@@ -348,10 +384,10 @@ for row in org_section_rows:
             new_col = f"attr_{attr_id}"
             if old_col in pivot_df.columns:
                 pivot_df = pivot_df.withColumnRenamed(old_col, new_col)
-    else:
-        pivot_df = current_section_records_df
 
-    final_df = current_section_records_df.join(pivot_df, "record_id", "left")
+        final_df = current_section_records_df.join(pivot_df, "record_id", "left")
+    else:
+        final_df = current_section_records_df
 
     target_table = f"public.org_{org_id}_section_{section_id}"
 

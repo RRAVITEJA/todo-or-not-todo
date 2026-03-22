@@ -1,0 +1,33 @@
+{
+    "name": "test",
+    "description": "",
+    "config": [
+        {
+            "sectionId": "176",
+            "attributeIds": [
+                1530,
+                1531,
+                1532
+            ]
+        },
+        {
+            "sectionId": "181",
+            "attributeIds": [
+                2120,
+                1599
+            ]
+        },
+        {
+            "sectionId": "228",
+            "attributeIds": [
+                1984
+            ]
+        },
+        {
+            "sectionId": "229",
+            "attributeIds": [
+                1928
+            ]
+        }
+    ]
+}
