@@ -29,3 +29,8 @@ CREATE TABLE report_section_attributes (
 )
 DISTKEY(report_id)
 SORTKEY(report_id, section_id, attribute_id);
+
+ALTER TABLE reports ADD org_id VARCHAR;
+ALTER TABLE reports ADD last_run_date TIMESTAMP;
+ALTER TABLE report_sections ADD org_id VARCHAR;
+ALTER TABLE report_section_attributes ADD org_id VARCHAR;

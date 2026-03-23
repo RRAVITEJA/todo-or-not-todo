@@ -10,10 +10,12 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 redshift = boto3.client("redshift-data")
+eventbridge = boto3.client("events")
 
 REDSHIFT_WORKGROUP_NAME = os.environ["REDSHIFT_WORKGROUP_NAME"]
 REDSHIFT_DATABASE = os.environ["REDSHIFT_DATABASE"]
 REDSHIFT_SECRET_ARN = os.environ["REDSHIFT_SECRET_ARN"]
+EVENT_BUS_ARN = os.environ["EVENT_BUS_ARN"]
 
 
 def lambda_handler(event, context):
@@ -78,6 +80,14 @@ def lambda_handler(event, context):
             """
             execute_sql(insert_attributes_sql)
 
+        detail_type = "CretaeMaterialized"
+        payload = {
+            "orgId": int(org_id) if str(org_id).isdigit() else org_id,
+            "reportId": report_id
+        }
+
+        send_eventbridge_event(detail_type, payload)
+
         return response(200, {
             "message": "Report saved successfully",
             "reportId": report_id,
@@ -87,6 +97,26 @@ def lambda_handler(event, context):
     except Exception as e:
         logger.exception("Error saving report")
         return response(500, {"error": str(e)})
+
+
+def send_eventbridge_event(detail_type, payload):
+    event = {
+        "Source": "lambda.readydoc.intivahealth.com",
+        "DetailType": detail_type,
+        "Detail": json.dumps(payload),
+        "EventBusName": EVENT_BUS_ARN,
+    }
+
+    result = eventbridge.put_events(Entries=[event])
+
+    if result["FailedEntryCount"] > 0:
+        error_entry = result["Entries"][0]
+        raise Exception(
+            f"Failed to publish EventBridge event: "
+            f"{error_entry.get('ErrorCode')} - {error_entry.get('ErrorMessage')}"
+        )
+
+    logger.info("EventBridge event sent successfully: %s", json.dumps(payload))
 
 
 def get_authorization_token(event):
@@ -134,7 +164,7 @@ def validate_config_for_org(config, org_id):
 
         valid_section_ids.add(int(section_id))
 
-        if section_id not in valid_attributes_by_section:
+        if int(section_id) not in valid_attributes_by_section:
             valid_attributes_by_section[int(section_id)] = set()
 
         if attribute_id is not None:
