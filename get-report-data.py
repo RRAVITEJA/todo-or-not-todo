@@ -16,16 +16,21 @@ REDSHIFT_SECRET_ARN = os.environ["REDSHIFT_SECRET_ARN"]
 
 def lambda_handler(event, context):
     try:
-        body = parse_body(event)
+        path_params = event.get("pathParameters") or {}
+        query_params = event.get("queryStringParameters") or {}
 
-        report_id = int(body["reportId"])
-        limit = int(body.get("limit", 100))
+        report_id = int(path_params["reportId"])
+        limit = int(query_params.get("limit", 100))
 
         if limit <= 0:
             return build_response(400, {"error": "limit must be greater than 0"})
 
         mv_name = f"report_{report_id}"
 
+        # Fetch report metadata
+        metadata = get_report_metadata(report_id)
+
+        # Fetch report data
         sql = f"SELECT * FROM {mv_name} LIMIT {limit};"
         logger.info("Executing query: %s", sql)
 
@@ -33,14 +38,42 @@ def lambda_handler(event, context):
 
         return build_response(200, {
             "reportId": report_id,
+            "reportName": metadata["reportName"],
+            "description": metadata["description"],
+            "lastRunDate": metadata["lastRunDate"],
             "materializedView": mv_name,
             "count": len(result["rows"]),
             "data": result["rows"]
         })
 
+    except KeyError as e:
+        logger.exception("Missing required path parameter")
+        return build_response(400, {"error": f"Missing required path parameter: {str(e)}"})
     except Exception as e:
         logger.exception("Error fetching report data")
         return build_response(400, {"error": str(e)})
+
+
+def get_report_metadata(report_id: int):
+    sql = f"""
+        SELECT name, description, last_run_date
+        FROM reports
+        WHERE report_id = {report_id}
+        LIMIT 1;
+    """
+
+    result = execute_query_with_column_names(sql)
+
+    if not result["rows"]:
+        raise Exception(f"Report not found for reportId={report_id}")
+
+    row = result["rows"][0]
+
+    return {
+        "reportName": row.get("name"),
+        "description": row.get("description"),
+        "lastRunDate": row.get("last_run_date")
+    }
 
 
 def execute_query_with_column_names(sql: str):
@@ -98,14 +131,6 @@ def wait_for_statement(statement_id: str):
             raise Exception(result.get("Error", f"Statement failed: {statement_id}"))
 
         time.sleep(1)
-
-
-def parse_body(event):
-    if "body" in event:
-        if isinstance(event["body"], str):
-            return json.loads(event["body"])
-        return event["body"]
-    return event
 
 
 def build_response(status_code: int, body: dict):

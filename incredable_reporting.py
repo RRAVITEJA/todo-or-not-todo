@@ -1,11 +1,11 @@
-import sys
 import re
+import sys
 import traceback
 
-from awsglue.utils import getResolvedOptions
 from awsglue.context import GlueContext
-from awsglue.job import Job
 from awsglue.dynamicframe import DynamicFrame
+from awsglue.job import Job
+from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from pyspark.sql import functions as F
 from pyspark.storagelevel import StorageLevel
@@ -24,9 +24,10 @@ REDSHIFT_TMP_DIR = "s3://aws-glue-assets-058264370635-us-east-2/temporary/"
 PROVIDER_PROFILE_TABLE = "readydoc.provider_profile"
 SECTION_TABLE = "readydoc.section"
 ATTRIBUTE_TABLE = "readydoc.attribute"
+ATTRIBUTE_OPTION_TABLE = "readydoc.attribute_option"
 ATTRIBUTE_VALUE_TABLE = "readydoc.attribute_value"
 
-WRITE_MODE = "overwrite"   # overwrite = drop/recreate each target table
+WRITE_MODE = "overwrite"  # overwrite = drop/recreate each target table
 
 
 # ----------------------------------------------------------
@@ -51,7 +52,6 @@ def log(msg):
 
 def read_rds_table(table_name, ctx_name):
     log(f"Reading RDS table: {table_name}")
-
     dyf = glue_context.create_dynamic_frame.from_options(
         connection_type="postgresql",
         connection_options={
@@ -61,7 +61,6 @@ def read_rds_table(table_name, ctx_name):
         },
         transformation_ctx=ctx_name,
     )
-
     df = dyf.toDF()
     log(f"Loaded table: {table_name}")
     return df
@@ -70,9 +69,10 @@ def read_rds_table(table_name, ctx_name):
 def sanitize_column_name(name: str) -> str:
     """
     Redshift-safe column name.
+
     Example:
-      123      -> attr_123
-      abc-def  -> abc_def
+        123 -> attr_123
+        abc-def -> abc_def
     """
     name = str(name).strip()
     name = re.sub(r"[^A-Za-z0-9_]", "_", name)
@@ -106,7 +106,6 @@ def redshift_type_from_spark_type(spark_type_str: str) -> str:
     if t == "date":
         return "DATE"
 
-    # all pivoted values are strings anyway
     return "VARCHAR(65535)"
 
 
@@ -121,10 +120,10 @@ def build_create_table_sql(table_name: str, df):
     columns_sql_str = ",\n    ".join(columns_sql)
 
     return f"""
-        CREATE TABLE {table_name} (
-            {columns_sql_str}
-        );
-    """
+CREATE TABLE {table_name} (
+    {columns_sql_str}
+);
+"""
 
 
 def write_df_to_redshift(df, table_name):
@@ -132,7 +131,6 @@ def write_df_to_redshift(df, table_name):
         log(f"Skipping empty DataFrame for table {table_name}")
         return
 
-    # sanitize all column names before write
     renamed_df = df
     for old_name in df.columns:
         new_name = sanitize_column_name(old_name)
@@ -143,20 +141,24 @@ def write_df_to_redshift(df, table_name):
 
     if WRITE_MODE == "overwrite":
         preactions = f"""
-            DROP TABLE IF EXISTS {table_name};
-            {create_sql}
-        """
+DROP TABLE IF EXISTS {table_name};
+{create_sql}
+"""
     else:
         preactions = f"""
-            CREATE TABLE IF NOT EXISTS {table_name} (
-                {", ".join([f'"{c}" VARCHAR(65535)' for c in renamed_df.columns])}
-            );
-        """
+CREATE TABLE IF NOT EXISTS {table_name} (
+    {", ".join([f'"{c}" VARCHAR(65535)' for c in renamed_df.columns])}
+);
+"""
 
     log(f"Writing to Redshift table: {table_name}")
     log(f"Columns: {renamed_df.columns}")
 
-    dyf = DynamicFrame.fromDF(renamed_df, glue_context, f"dyf_{table_name.replace('.', '_')}")
+    dyf = DynamicFrame.fromDF(
+        renamed_df,
+        glue_context,
+        f"dyf_{table_name.replace('.', '_')}",
+    )
 
     glue_context.write_dynamic_frame.from_jdbc_conf(
         frame=dyf,
@@ -204,9 +206,20 @@ try:
             F.col("name").alias("attribute_name"),
             "section_id",
             "org_id",
+            F.col("type").cast("string").alias("attribute_type"),
         )
         .filter(F.col("section_id").isNotNull())
         .filter(F.col("attribute_id").isNotNull())
+    )
+
+    attribute_option_df = (
+        read_rds_table(ATTRIBUTE_OPTION_TABLE, "attribute_option_ctx")
+        .select(
+            "attribute_id",
+            F.col("value").cast("string").alias("attribute_option_value"),
+        )
+        .filter(F.col("attribute_id").isNotNull())
+        .filter(F.col("attribute_option_value").isNotNull())
     )
 
     attribute_value_df = (
@@ -271,17 +284,13 @@ values_with_context_df = (
     )
 )
 
-records_df = (
-    records_df
-    .repartition("org_id", "section_id")
-    .persist(StorageLevel.MEMORY_AND_DISK)
+records_df = records_df.repartition("org_id", "section_id").persist(
+    StorageLevel.MEMORY_AND_DISK
 )
 
-values_with_context_df = (
-    values_with_context_df
-    .repartition("org_id", "section_id")
-    .persist(StorageLevel.MEMORY_AND_DISK)
-)
+values_with_context_df = values_with_context_df.repartition(
+    "org_id", "section_id"
+).persist(StorageLevel.MEMORY_AND_DISK)
 
 attribute_df = attribute_df.persist(StorageLevel.MEMORY_AND_DISK)
 
@@ -291,16 +300,34 @@ attribute_df.count()
 
 
 # ----------------------------------------------------------
+# Build attribute options lookup
+# attribute_options = CSV of attribute_option.value
+# ----------------------------------------------------------
+attribute_options_agg_df = (
+    attribute_option_df.groupBy("attribute_id")
+    .agg(
+        F.concat_ws(
+            ",",
+            F.sort_array(F.collect_list("attribute_option_value"))
+        ).alias("attribute_options")
+    )
+)
+
+
+# ----------------------------------------------------------
 # Build attribute_section lookup table
 # ----------------------------------------------------------
 attribute_section_df = (
     attribute_df.join(section_df, on="section_id", how="inner")
+    .join(attribute_options_agg_df, on="attribute_id", how="left")
     .select(
         "attribute_id",
         "section_id",
         "attribute_name",
         "section_name",
         "org_id",
+        "attribute_type",
+        "attribute_options",
     )
     .persist(StorageLevel.MEMORY_AND_DISK)
 )
@@ -339,28 +366,27 @@ for row in org_section_rows:
     section_id = row["section_id"]
     section_name = row["section_name"]
 
-    log(f"Processing org_id={org_id}, section_id={section_id}, section_name={section_name}")
+    log(
+        f"Processing org_id={org_id}, "
+        f"section_id={section_id}, "
+        f"section_name={section_name}"
+    )
 
     current_section_records_df = (
         records_df.filter(
-            (F.col("org_id") == org_id) &
-            (F.col("section_id") == section_id)
-        )
-        .select("record_id", "provider_id")
+            (F.col("org_id") == org_id) & (F.col("section_id") == section_id)
+        ).select("record_id", "provider_id")
     )
 
     current_section_values_df = (
         values_with_context_df.filter(
-            (F.col("org_id") == org_id) &
-            (F.col("section_id") == section_id)
-        )
-        .select("record_id", "attribute_id", "value")
+            (F.col("org_id") == org_id) & (F.col("section_id") == section_id)
+        ).select("record_id", "attribute_id", "value")
     )
 
     current_section_attribute_rows = (
         attribute_df.filter(
-            (F.col("org_id") == org_id) &
-            (F.col("section_id") == section_id)
+            (F.col("org_id") == org_id) & (F.col("section_id") == section_id)
         )
         .select("attribute_id")
         .distinct()
@@ -368,17 +394,17 @@ for row in org_section_rows:
         .collect()
     )
 
-    current_section_attribute_ids = [r["attribute_id"] for r in current_section_attribute_rows]
+    current_section_attribute_ids = [
+        r["attribute_id"] for r in current_section_attribute_rows
+    ]
 
     if current_section_attribute_ids:
         pivot_df = (
-            current_section_values_df
-            .groupBy("record_id")
+            current_section_values_df.groupBy("record_id")
             .pivot("attribute_id", current_section_attribute_ids)
             .agg(F.first("value"))
         )
 
-        # rename pivoted attribute columns to attr_<id>
         for attr_id in current_section_attribute_ids:
             old_col = str(attr_id)
             new_col = f"attr_{attr_id}"

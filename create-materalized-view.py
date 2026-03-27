@@ -16,78 +16,95 @@ REDSHIFT_SECRET_ARN = os.environ["REDSHIFT_SECRET_ARN"]
 
 
 def lambda_handler(event, context):
+    trigger_type = detect_trigger_type(event)
+
+    org_id = None
+    report_id = None
+
     try:
-        body = parse_body(event)
+        logger.info("Received event: %s", json.dumps(event))
 
-        token = get_authorization_token(event)
-        org_id = get_org_id_from_token(token)
+        org_id, report_id, trigger_type = extract_request_context(event)
 
-        report_id = int(body["reportId"])
+        update_report_status(report_id, "running")
 
-        rows = get_report_rows(report_id)
+        attribute_rows = get_report_rows(report_id)
+        filter_rows = get_report_filters(report_id)
 
-        if not rows:
-            return build_response(404, {"error": f"No config found for reportId {report_id}"})
+        if not attribute_rows:
+            update_report_status(report_id, "failed")
+            return build_response(
+                404,
+                {"error": f"No config found for reportId {report_id}"},
+                trigger_type
+            )
 
-        select_query = build_query_from_rows(org_id, rows)
+        query = build_query_from_rows(org_id, attribute_rows, filter_rows)
 
-        logger.info("Generated SELECT query for reportId %s:\n%s", report_id, select_query)
+        logger.info("Generated query:\n%s", query)
 
         mv_name = f"report_{report_id}"
 
-        create_materialized_view(mv_name, select_query)
+        create_materialized_view(mv_name, query)
 
-        return build_response(200, {
-            "message": "Materialized view created successfully",
-            "reportId": report_id,
-            "materializedViewName": mv_name,
-            "query": select_query
-        })
+        mark_report_completed(report_id)
+
+        return build_response(
+            200,
+            {
+                "message": "Materialized view created successfully",
+                "reportId": report_id,
+                "materializedView": mv_name,
+                "query": query
+            },
+            trigger_type
+        )
 
     except Exception as e:
-        logger.exception("Error generating query / creating materialized view")
-        return build_response(400, {"error": str(e)})
+        logger.exception("Error")
+
+        if report_id:
+            try:
+                update_report_status(report_id, "failed")
+            except:
+                pass
+
+        return build_response(400, {"error": str(e)}, trigger_type)
 
 
-def get_authorization_token(event):
-    headers = event.get("headers") or {}
-    return headers.get("authorization") or headers.get("Authorization")
+# -----------------------------
+# FETCH DATA
+# -----------------------------
 
-
-def get_org_id_from_token(token: str):
-    if token.startswith("Bearer "):
-        token = token[7:]
-
-    parts = token.split(".")
-    if len(parts) != 3:
-        raise ValueError("Invalid JWT token")
-
-    payload_b64 = parts[1]
-    payload_b64 += "=" * (-len(payload_b64) % 4)
-
-    payload_json = base64.urlsafe_b64decode(payload_b64).decode("utf-8")
-    payload = json.loads(payload_json)
-
-    return payload.get("org_id")
-
-
-def get_report_rows(report_id: int):
+def get_report_rows(report_id):
     sql = f"""
         SELECT section_id, attribute_id
         FROM report_section_attributes
-        WHERE report_id = {report_id}
-        ORDER BY section_id, attribute_id;
+        WHERE report_id = {report_id};
     """
     return execute_query(sql)
 
 
-def build_query_from_rows(org_id: int, rows: list[list[int]]) -> str:
+def get_report_filters(report_id):
+    sql = f"""
+        SELECT section_id, attribute_id, operator, value
+        FROM report_filters
+        WHERE report_id = {report_id};
+    """
+    return execute_query(sql)
+
+
+# -----------------------------
+# QUERY BUILDER (NO ORDER BY)
+# -----------------------------
+
+def build_query_from_rows(org_id, rows, filter_rows):
     section_attrs = {}
     section_order = []
 
     for row in rows:
-        section_id = int(row[0])
-        attribute_id = int(row[1])
+        section_id = str(parse_value(row[0]))
+        attribute_id = str(parse_value(row[1]))
 
         if section_id not in section_attrs:
             section_attrs[section_id] = []
@@ -96,19 +113,19 @@ def build_query_from_rows(org_id: int, rows: list[list[int]]) -> str:
         section_attrs[section_id].append(attribute_id)
 
     if not section_order:
-        raise ValueError("No sections found for report")
+        raise ValueError("No sections found")
 
-    aliases = {section_id: f"s{section_id}" for section_id in section_order}
+    aliases = {sid: f"s{sid}" for sid in section_order}
 
     first_section_id = section_order[0]
     first_alias = aliases[first_section_id]
 
     select_cols = [f"{first_alias}.provider_id"]
 
-    for section_id in section_order:
-        alias = aliases[section_id]
-        for attribute_id in section_attrs[section_id]:
-            select_cols.append(f"{alias}.attr_{attribute_id}")
+    for sid in section_order:
+        alias = aliases[sid]
+        for attr in section_attrs[sid]:
+            select_cols.append(f"{alias}.attr_{attr}")
 
     sql_parts = [
         "SELECT",
@@ -116,46 +133,117 @@ def build_query_from_rows(org_id: int, rows: list[list[int]]) -> str:
         f"FROM org_{org_id}_section_{first_section_id} {first_alias}"
     ]
 
-    for section_id in section_order[1:]:
-        alias = aliases[section_id]
+    for sid in section_order[1:]:
+        alias = aliases[sid]
         sql_parts.append(
-            f"LEFT JOIN org_{org_id}_section_{section_id} {alias}\n"
-            f"    ON {first_alias}.provider_id = {alias}.provider_id"
+            f"LEFT JOIN org_{org_id}_section_{sid} {alias} "
+            f"ON {first_alias}.provider_id = {alias}.provider_id"
         )
+
+    where_clauses = []
+
+    for row in filter_rows:
+        section_id = str(parse_value(row[0]))
+        attribute_id = str(parse_value(row[1]))
+        operator = str(parse_value(row[2])).strip().upper()
+        value = parse_value(row[3])
+
+        alias = aliases.get(section_id)
+        if not alias:
+            continue
+
+        column = f"{alias}.attr_{attribute_id}"
+
+        if value is None:
+            continue
+
+        value_str = str(value).strip().replace("'", "''")
+
+        if operator == "=":
+            where_clauses.append(f"{column} = '{value_str}'")
+
+        elif operator in ["!=", "<>"]:
+            where_clauses.append(f"{column} <> '{value_str}'")
+
+        elif operator == ">":
+            where_clauses.append(f"{column} > '{value_str}'")
+
+        elif operator == "<":
+            where_clauses.append(f"{column} < '{value_str}'")
+
+        elif operator == "CONTAINS":
+            where_clauses.append(f"{column} ILIKE '%{value_str}%'")
+
+        elif operator == "IN":
+            values = [v.strip().replace("'", "''") for v in value_str.split(",") if v.strip()]
+            if values:
+                in_values = ", ".join([f"'{v}'" for v in values])
+                where_clauses.append(f"{column} IN ({in_values})")
+
+        else:
+            raise ValueError(f"Unsupported operator: {operator}")
+
+    if where_clauses:
+        sql_parts.append("WHERE")
+        sql_parts.append("    " + "\n    AND ".join(where_clauses))
 
     return "\n".join(sql_parts)
 
+# -----------------------------
+# CREATE MV
+# -----------------------------
 
-def create_materialized_view(mv_name: str, select_query: str):
+def create_materialized_view(name, query):
     sql = f"""
-        DROP MATERIALIZED VIEW IF EXISTS {mv_name};
+        DROP MATERIALIZED VIEW IF EXISTS {name};
 
-        CREATE MATERIALIZED VIEW {mv_name}
+        CREATE MATERIALIZED VIEW {name}
         AUTO REFRESH NO
         AS
-        {select_query};
+        {query};
     """
-
-    logger.info("Creating materialized view %s", mv_name)
     execute_sql(sql)
 
 
-def execute_sql(sql: str):
-    logger.info("Executing SQL:\n%s", sql)
+# -----------------------------
+# REPORT STATUS
+# -----------------------------
 
+def update_report_status(report_id, status):
+    sql = f"""
+        UPDATE reports
+        SET status = '{status}', updated_at = GETDATE()
+        WHERE report_id = {report_id};
+    """
+    execute_sql(sql)
+
+
+def mark_report_completed(report_id):
+    sql = f"""
+        UPDATE reports
+        SET status = 'completed',
+            last_run_date = GETDATE(),
+            updated_at = GETDATE()
+        WHERE report_id = {report_id};
+    """
+    execute_sql(sql)
+
+
+# -----------------------------
+# EXECUTION HELPERS
+# -----------------------------
+
+def execute_sql(sql):
     result = redshift.execute_statement(
         WorkgroupName=REDSHIFT_WORKGROUP_NAME,
         Database=REDSHIFT_DATABASE,
         SecretArn=REDSHIFT_SECRET_ARN,
         Sql=sql
     )
+    wait(result["Id"])
 
-    wait_for_statement(result["Id"])
 
-
-def execute_query(sql: str):
-    logger.info("Executing query:\n%s", sql)
-
+def execute_query(sql):
     result = redshift.execute_statement(
         WorkgroupName=REDSHIFT_WORKGROUP_NAME,
         Database=REDSHIFT_DATABASE,
@@ -164,58 +252,85 @@ def execute_query(sql: str):
     )
 
     statement_id = result["Id"]
-    wait_for_statement(statement_id)
+    wait(statement_id)
 
-    query_result = redshift.get_statement_result(Id=statement_id)
-    records = query_result.get("Records", [])
-
-    parsed_rows = []
-
-    for record in records:
-        parsed_row = []
-        for cell in record:
-            if "longValue" in cell:
-                parsed_row.append(cell["longValue"])
-            elif "stringValue" in cell:
-                parsed_row.append(cell["stringValue"])
-            elif "doubleValue" in cell:
-                parsed_row.append(cell["doubleValue"])
-            elif cell.get("isNull"):
-                parsed_row.append(None)
-            else:
-                parsed_row.append(None)
-        parsed_rows.append(parsed_row)
-
-    return parsed_rows
+    output = redshift.get_statement_result(Id=statement_id)
+    return output.get("Records", [])
 
 
-def wait_for_statement(statement_id: str):
+def wait(statement_id):
     while True:
-        result = redshift.describe_statement(Id=statement_id)
-        status = result["Status"]
+        res = redshift.describe_statement(Id=statement_id)
+        status = res["Status"]
 
         if status == "FINISHED":
             return
 
-        if status in ("FAILED", "ABORTED"):
-            raise Exception(result.get("Error", f"Statement failed: {statement_id}"))
+        if status in ["FAILED", "ABORTED"]:
+            raise Exception(res.get("Error"))
 
         time.sleep(1)
 
 
-def parse_body(event):
-    if "body" in event:
-        if isinstance(event["body"], str):
-            return json.loads(event["body"])
-        return event["body"]
-    return event
+def parse_value(cell):
+    if "stringValue" in cell:
+        return cell["stringValue"]
+    if "longValue" in cell:
+        return cell["longValue"]
+    if "doubleValue" in cell:
+        return cell["doubleValue"]
+    if "booleanValue" in cell:
+        return cell["booleanValue"]
+    if cell.get("isNull"):
+        return None
+    return None
 
 
-def build_response(status_code: int, body: dict):
-    return {
-        "statusCode": status_code,
-        "headers": {
-            "Content-Type": "application/json"
-        },
-        "body": json.dumps(body)
-    }
+# -----------------------------
+# REQUEST HELPERS
+# -----------------------------
+
+def detect_trigger_type(event):
+    if "detail" in event:
+        return "eventbridge"
+    return "api"
+
+
+def extract_request_context(event):
+    if "detail" in event:
+        detail = event["detail"]
+        if isinstance(detail, str):
+            detail = json.loads(detail)
+        return detail["orgId"], detail["reportId"], "eventbridge"
+
+    token = get_authorization_token(event)
+    org_id = get_org_id_from_token(token)
+
+    report_id = int(event["pathParameters"]["reportId"])
+
+    return org_id, report_id, "api"
+
+
+def get_authorization_token(event):
+    headers = event.get("headers") or {}
+    return headers.get("authorization") or headers.get("Authorization")
+
+
+def get_org_id_from_token(token):
+    if token.startswith("Bearer "):
+        token = token[7:]
+
+    payload = token.split(".")[1]
+    payload += "=" * (-len(payload) % 4)
+
+    decoded = base64.urlsafe_b64decode(payload).decode()
+    return json.loads(decoded)["org_id"]
+
+
+def build_response(code, body, trigger_type):
+    if trigger_type == "api":
+        return {
+            "statusCode": code,
+            "body": json.dumps(body)
+        }
+    return body

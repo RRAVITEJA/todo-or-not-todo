@@ -1,7 +1,6 @@
 import json
 import os
 import time
-import random
 import logging
 import boto3
 import base64
@@ -30,6 +29,12 @@ def lambda_handler(event, context):
         if not org_id:
             return response(401, {"error": "org_id not found in token"})
 
+        path_params = event.get("pathParameters") or {}
+        if "reportId" not in path_params:
+            return response(400, {"error": "reportId is required in pathParameters"})
+
+        report_id = int(path_params["reportId"])
+
         body = parse_body(event)
 
         name = body.get("name")
@@ -50,31 +55,30 @@ def lambda_handler(event, context):
         if not isinstance(sorts, list):
             return response(400, {"error": "sorts must be a list"})
 
+        # validate report belongs to org
+        validate_report_exists_for_org(report_id, org_id)
+
+        # validate new config
         validate_config_for_org(config, filters, sorts, org_id)
 
-        report_id = generate_report_id()
-
-        insert_report_sql = f"""
-            INSERT INTO reports (
-                report_id,
-                org_id,
-                name,
-                description,
-                status,
-                created_at,
-                updated_at
-            )
-            VALUES (
-                {report_id},
-                '{escape(org_id)}',
-                '{escape(name)}',
-                '{escape(description)}',
-                'created',
-                GETDATE(),
-                GETDATE()
-            );
+        # update main report row
+        update_report_sql = f"""
+            UPDATE reports
+            SET
+                name = '{escape(name)}',
+                description = '{escape(description)}',
+                status = 'created',
+                updated_at = GETDATE()
+            WHERE report_id = {report_id}
+              AND org_id = '{escape(org_id)}';
         """
-        execute_sql(insert_report_sql)
+        execute_sql(update_report_sql)
+
+        # clear existing config rows
+        execute_sql(f"DELETE FROM report_sections WHERE report_id = {report_id} AND org_id = '{escape(org_id)}';")
+        execute_sql(f"DELETE FROM report_section_attributes WHERE report_id = {report_id} AND org_id = '{escape(org_id)}';")
+        execute_sql(f"DELETE FROM report_filters WHERE report_id = {report_id} AND org_id = '{escape(org_id)}';")
+        execute_sql(f"DELETE FROM report_sorts WHERE report_id = {report_id} AND org_id = '{escape(org_id)}';")
 
         section_values = []
         attribute_values = []
@@ -145,6 +149,7 @@ def lambda_handler(event, context):
             """
             execute_sql(insert_sorts_sql)
 
+        # recreate materialized view
         detail_type = "CretaeMaterialized"
         payload = {
             "orgId": int(org_id) if str(org_id).isdigit() else org_id,
@@ -154,14 +159,29 @@ def lambda_handler(event, context):
         send_eventbridge_event(detail_type, payload)
 
         return response(200, {
-            "message": "Report saved successfully",
+            "message": "Report updated successfully",
             "reportId": report_id,
             "orgId": org_id
         })
 
     except Exception as e:
-        logger.exception("Error saving report")
+        logger.exception("Error updating report")
         return response(500, {"error": str(e)})
+
+
+def validate_report_exists_for_org(report_id, org_id):
+    sql = f"""
+        SELECT report_id
+        FROM reports
+        WHERE report_id = {report_id}
+          AND org_id = '{escape(org_id)}'
+        LIMIT 1;
+    """
+
+    records = run_query(sql)
+
+    if not records:
+        raise Exception(f"Report {report_id} not found for org_id {org_id}")
 
 
 def send_eventbridge_event(detail_type, payload):
@@ -236,7 +256,6 @@ def validate_config_for_org(config, filters, sorts, org_id):
         if attribute_id is not None:
             valid_attributes_by_section[section_id].add(str(attribute_id))
 
-    # validate config
     for item in config:
         if "sectionId" not in item:
             raise Exception("sectionId is required in each config item")
@@ -254,7 +273,6 @@ def validate_config_for_org(config, filters, sorts, org_id):
                     f"Invalid attributeId {attribute_id} for sectionId {section_id} and org_id {org_id}"
                 )
 
-    # validate filters
     for item in filters:
         if "sectionId" not in item or "attributeId" not in item or "operator" not in item:
             raise Exception("Each filter must contain sectionId, attributeId, and operator")
@@ -275,7 +293,6 @@ def validate_config_for_org(config, filters, sorts, org_id):
         if operator.upper() not in allowed_operators:
             raise Exception(f"Invalid filter operator: {operator}")
 
-    # validate sorts
     for item in sorts:
         if "sectionId" not in item or "attributeId" not in item:
             raise Exception("Each sort must contain sectionId and attributeId")
@@ -337,10 +354,6 @@ def run_query(sql: str):
             break
 
     return records
-
-
-def generate_report_id():
-    return int(f"{int(time.time() * 1000)}{random.randint(100, 999)}")
 
 
 def execute_sql(sql: str):
